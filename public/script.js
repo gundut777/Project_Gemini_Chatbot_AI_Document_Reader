@@ -90,15 +90,24 @@ chatForm.addEventListener('submit', async function (e) {
       }),
     });
 
-    if (!response.ok) throw new Error('Koneksi server terputus');
+    let data = {};
+    try {
+      data = await response.json();
+    } catch (err) {
+      // Jika response bukan JSON
+      data = {};
+    }
 
-    const data = await response.json();
-    
     // Sembunyikan indikator mengetik sebelum menampilkan pesan
     typingIndicator.style.display = 'none';
-    
-    appendMessage('bot', data.text || 'Maaf, saya tidak menemukan jawaban yang relevan dalam dokumen.');
-    
+
+    if (data.error) {
+      appendMessage('bot', data.error);
+    } else if (data.text) {
+      appendMessage('bot', data.text);
+    } else {
+      appendMessage('bot', 'Maaf, saya tidak menemukan jawaban yang relevan dalam dokumen.');
+    }
   } catch (error) {
     console.error('Error:', error);
     typingIndicator.style.display = 'none';

@@ -1,3 +1,4 @@
+
 import { GoogleGenAI } from "@google/genai";
 import dotenv from "dotenv";
 import express from "express";
@@ -10,11 +11,45 @@ dotenv.config();
 //const ai = new GoogleGenAI({});
 
 const app = express()
+
 import fs from "fs";
 import path from "path";
 import * as pdfjs from 'pdfjs-dist/legacy/build/pdf.mjs';
+import Database from 'better-sqlite3';
+
+// Inisialisasi database SQLite untuk metadata dokumen
+const dbPath = path.join('uploads', 'metadata.db');
+const db = new Database(dbPath);
+// Buat tabel jika belum ada
+db.prepare(`CREATE TABLE IF NOT EXISTS documents (
+  id TEXT PRIMARY KEY,
+  originalName TEXT,
+  summary TEXT,
+  topic TEXT,
+  uploadedAt TEXT
+)`).run();
 
 const upload = multer({ dest: 'uploads/' })
+
+
+
+// ...existing code...
+
+// Middleware
+app.use(express.static('public'));
+app.use(express.json());
+app.use(cors());
+
+// Endpoint untuk menampilkan daftar dokumen dari database
+app.get('/list-documents', (req, res) => {
+  try {
+    const rows = db.prepare('SELECT id, originalName, summary, topic, uploadedAt FROM documents ORDER BY uploadedAt DESC').all();
+    res.status(200).json({ documents: rows });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
 // Endpoint upload PDF
 app.post('/upload-pdf', upload.single('pdf'), async (req, res) => {
   if (!req.file) {
@@ -29,20 +64,51 @@ app.post('/upload-pdf', upload.single('pdf'), async (req, res) => {
       disableFontFace: true
     });
     const pdfDoc = await loadingTask.promise;
-    
+
     let fullText = '';
     for (let i = 1; i <= pdfDoc.numPages; i++) {
-        const page = await pdfDoc.getPage(i);
-        const textContent = await page.getTextContent();
-        const pageText = textContent.items.map(item => item.str).join(' ');
-        fullText += pageText + '\n';
+      const page = await pdfDoc.getPage(i);
+      const textContent = await page.getTextContent();
+      const pageText = textContent.items.map(item => item.str).join(' ');
+      fullText += pageText + '\n';
     }
 
     // Simpan hasil ekstraksi dan file path, misal pakai nama file sebagai ID
     const pdfId = path.basename(filePath);
-    // Simpan hasil ekstraksi ke file (opsional, bisa juga ke DB)
     fs.writeFileSync(`uploads/${pdfId}.txt`, fullText, 'utf8');
-    res.status(200).json({ id: pdfId, text: fullText });
+
+    // Generate ringkasan/topik dokumen menggunakan AI
+    let summary = "";
+    let topic = "";
+    try {
+      const aiSummaryPrompt = [
+        { text: `Buatkan ringkasan singkat (1-2 kalimat) dari dokumen berikut dalam bahasa Indonesia:\n${fullText.substring(0, 3000)}` },
+      ];
+      const aiTopicPrompt = [
+        { text: `Tentukan topik utama atau kategori dari dokumen berikut (jawab 3-7 kata saja, tanpa penjelasan):\n${fullText.substring(0, 3000)}` },
+      ];
+      // Ringkasan
+      const summaryResp = await ai.models.generateContent({
+        model: process.env.MODEL,
+        contents: aiSummaryPrompt,
+      });
+      summary = summaryResp.text?.trim() || "";
+      // Topik
+      const topicResp = await ai.models.generateContent({
+        model: process.env.MODEL,
+        contents: aiTopicPrompt,
+      });
+      topic = topicResp.text?.trim() || "";
+    } catch (err) {
+      summary = "(Gagal generate ringkasan AI)";
+      topic = "(Gagal generate topik AI)";
+    }
+
+    // Simpan metadata ke database SQLite
+    db.prepare(`INSERT OR REPLACE INTO documents (id, originalName, summary, topic, uploadedAt) VALUES (?, ?, ?, ?, ?)`)
+      .run(pdfId, req.file.originalname, summary, topic, new Date().toISOString());
+
+    res.status(200).json({ id: pdfId, text: fullText, summary, topic });
   } catch (error) {
     res.status(500).json({ error: error.message });
   }
@@ -148,29 +214,48 @@ app.post('/reading-image', upload.single('image'), async (req, res) => {
 
 app.post('/reading-chat', async (req, res) => {
   const { chat, pdfId } = req.body;
-  try {    
-    if(!Array.isArray(chat)) {
+  try {
+    if (!Array.isArray(chat)) {
       return res.status(400).json({ error: "missing chat array" });
     }
 
+    let selectedPdfId = pdfId;
     let pdfContext = "";
-    if (pdfId) {
-      const pdfTextPath = path.join('uploads', `${pdfId}.txt`);
+
+    // Jika pdfId tidak diberikan, cari dokumen paling relevan dari database
+    if (!selectedPdfId) {
+      // Ambil pertanyaan terakhir user
+      const lastUserMsg = [...chat].reverse().find(msg => msg.role === 'user');
+      const userText = lastUserMsg ? lastUserMsg.text : '';
+      // Cari dokumen yang summary atau topic-nya paling cocok (LIKE sederhana)
+      const row = db.prepare(`SELECT id FROM documents WHERE summary LIKE ? OR topic LIKE ? ORDER BY uploadedAt DESC LIMIT 1`).get(`%${userText}%`, `%${userText}%`);
+      if (row && row.id) {
+        selectedPdfId = row.id;
+      }
+    }
+
+    if (selectedPdfId) {
+      const pdfTextPath = path.join('uploads', `${selectedPdfId}.txt`);
       if (fs.existsSync(pdfTextPath)) {
         pdfContext = fs.readFileSync(pdfTextPath, 'utf8');
       }
     }
 
-    const contents = chat.map(({role, text}, index) => {
-        let finalText = text;
-        // Jika ada konteks PDF, tambahkan ke pesan terakhir dari user
-        if (index === chat.length - 1 && role === 'user' && pdfContext) {
-            finalText = `KONTEKS DATA (PDF):\n${pdfContext}\n\nPERTANYAAN USER:\n${text}`;
-        }
-        return {
-            role,
-            parts: [{text: finalText}]
-        };
+    // Jika tidak ditemukan dokumen relevan, balas error
+    if (!pdfContext) {
+      return res.status(404).json({ error: "Tidak ditemukan dokumen relevan untuk pertanyaan ini." });
+    }
+
+    const contents = chat.map(({ role, text }, index) => {
+      let finalText = text;
+      // Jika ada konteks PDF, tambahkan ke pesan terakhir dari user
+      if (index === chat.length - 1 && role === 'user' && pdfContext) {
+        finalText = `KONTEKS DATA (PDF):\n${pdfContext}\n\nPERTANYAAN USER:\n${text}`;
+      }
+      return {
+        role,
+        parts: [{ text: finalText }]
+      };
     });
 
     const response = await ai.models.generateContent({
